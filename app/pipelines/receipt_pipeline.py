@@ -1,0 +1,138 @@
+import logging
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from app.models.responses import ReceiptExtractedData, ReceiptValidationResponse
+from app.pipelines.base_pipeline import BasePipeline
+from app.services.ai_interfaces import OCRProvider, VisionProvider
+from app.services.ocr_service import receipt_ocr_service
+from app.services.rules_engine import rules_engine
+from app.services.scoring_service import ScoringService, scoring_service
+from app.services.vision_service import receipt_vision_service
+
+logger = logging.getLogger(__name__)
+
+_DOCUMENT_TYPE = "RECEIPT"
+
+
+class ReceiptPipeline(BasePipeline):
+    """
+    Orchestrates the full validation pipeline for receipt documents.
+
+    Steps:
+        1. OCR  — extract text and fields from the image
+        2. Vision — assess authenticity, detect tampering
+        3. Rules  — validate required receipt fields
+        4. Score  — compute weighted confidence and routing decision
+    """
+
+    def __init__(
+        self,
+        ocr: OCRProvider,
+        vision: VisionProvider,
+        scoring: ScoringService,
+    ) -> None:
+        self.ocr_service = ocr
+        self.vision_service = vision
+        self.scoring_service = scoring
+
+    async def process(
+        self,
+        image_bytes: bytes,
+        media_type: str,
+        metadata: dict,
+    ) -> ReceiptValidationResponse:
+        """
+        Run OCR → Vision → Rules → Scoring for a receipt image.
+
+        Args:
+            image_bytes: Raw bytes of the receipt image.
+            media_type:  MIME type of the image.
+            metadata:    Must contain 'client_id' and optionally 'source'.
+
+        Returns:
+            ReceiptValidationResponse with all validation data.
+        """
+        request_id = uuid4()
+        start = self._start_timer()
+
+        logger.info(
+            "Starting receipt pipeline | request_id=%s client_id=%s source=%s",
+            request_id,
+            metadata.get("client_id"),
+            metadata.get("source"),
+        )
+
+        # Step 1 — OCR
+        ocr_result = await self.ocr_service.extract_text(image_bytes, media_type)
+        logger.debug("OCR done | request_id=%s confidence=%.2f", request_id, ocr_result.confidence)
+
+        # Step 2 — Vision AI
+        vision_result = await self.vision_service.analyze_document(
+            image_bytes,
+            _DOCUMENT_TYPE,
+            media_type,
+        )
+        logger.debug(
+            "Vision done | request_id=%s authentic=%s score=%.2f",
+            request_id,
+            vision_result.is_authentic,
+            vision_result.authenticity_score,
+        )
+
+        # Step 3 — Rules engine
+        rules_result = rules_engine.validate_receipt(ocr_result)
+        logger.debug(
+            "Rules done | request_id=%s passed=%s failed=%s",
+            request_id,
+            rules_result.passed_rules,
+            rules_result.failed_rules,
+        )
+
+        # Step 4 — Scoring
+        scoring_result = self.scoring_service.calculate_score(
+            ocr_result, vision_result, rules_result
+        )
+
+        elapsed_ms = self._elapsed_ms(start)
+        self._log_result(
+            request_id,
+            _DOCUMENT_TYPE,
+            scoring_result.final_score,
+            scoring_result.decision.value,
+            elapsed_ms,
+        )
+
+        # Build extracted data from OCR structured fields
+        fields = ocr_result.structured_fields
+        extracted = ReceiptExtractedData(
+            date=fields.get("date") or fields.get("fecha"),
+            total=fields.get("total") or fields.get("importe") or fields.get("amount"),
+            issuer=fields.get("issuer") or fields.get("emisor") or fields.get("company"),
+            receipt_number=(
+                fields.get("receipt_number")
+                or fields.get("folio")
+                or fields.get("numero")
+                or fields.get("ticket")
+            ),
+        )
+
+        return ReceiptValidationResponse(
+            request_id=request_id,
+            timestamp=datetime.now(timezone.utc),
+            processing_time_ms=elapsed_ms,
+            document_type=_DOCUMENT_TYPE,
+            final_score=scoring_result.final_score,
+            decision=scoring_result.decision,
+            requires_human_review=scoring_result.requires_human_review,
+            extracted_data=extracted,
+            fraud_indicators=vision_result.fraud_indicators,
+            breakdown=scoring_result.breakdown,
+        )
+
+
+receipt_pipeline = ReceiptPipeline(
+    ocr=receipt_ocr_service,
+    vision=receipt_vision_service,
+    scoring=scoring_service,
+)
