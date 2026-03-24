@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     AI_PROVIDER: str = "anthropic"
     AI_PROVIDER_IDENTITY: str = ""
     AI_PROVIDER_RECEIPT: str = ""
+    OCR_PROVIDER_IDENTITY: str = ""
+    OCR_PROVIDER_RECEIPT: str = ""
+    VISION_PROVIDER_IDENTITY: str = ""
+    VISION_PROVIDER_RECEIPT: str = ""
 
     # Claude / Anthropic
     ANTHROPIC_API_KEY: str = ""
@@ -30,6 +34,12 @@ class Settings(BaseSettings):
     OPENAI_MODEL: str = "gpt-4.1-mini"
     OPENAI_TIMEOUT_SECONDS: float = 20.0
     OPENAI_MAX_RETRIES: int = 1
+
+    # Ollama
+    OLLAMA_HOST: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "llama3.2-vision:11b"
+    OLLAMA_TIMEOUT_SECONDS: float = 30.0
+    OLLAMA_MAX_RETRIES: int = 1
 
     # API Key auth (comma-separated list)
     API_KEYS: str = "dev-key-1"
@@ -64,10 +74,37 @@ class Settings(BaseSettings):
         }
         configured_provider = provider_by_pipeline.get(pipeline_name, "")
         provider = self._normalize_provider(configured_provider or self.AI_PROVIDER)
-        if provider not in {"anthropic", "openai"}:
+        if provider not in {"anthropic", "openai", "ollama"}:
             raise RuntimeConfigurationError(
-                f"Provider for pipeline '{pipeline_name}' must be 'anthropic' or 'openai', got "
-                f"'{configured_provider or self.AI_PROVIDER}'."
+                f"Provider for pipeline '{pipeline_name}' must be 'anthropic', 'openai' or "
+                f"'ollama', got '{configured_provider or self.AI_PROVIDER}'."
+            )
+        return provider
+
+    def provider_for_stage(self, pipeline_name: str, stage_name: str) -> str:
+        stage = stage_name.strip().lower()
+        stage_provider_by_pipeline = {
+            "ocr": {
+                "identity": self.OCR_PROVIDER_IDENTITY,
+                "receipt": self.OCR_PROVIDER_RECEIPT,
+            },
+            "vision": {
+                "identity": self.VISION_PROVIDER_IDENTITY,
+                "receipt": self.VISION_PROVIDER_RECEIPT,
+            },
+        }
+        configured_stage_provider = stage_provider_by_pipeline.get(stage, {}).get(pipeline_name, "")
+        if configured_stage_provider.strip():
+            provider = self._normalize_provider(configured_stage_provider)
+        else:
+            provider = self.provider_for_pipeline(pipeline_name)
+
+        allowed_providers = {"anthropic", "openai", "ollama"}
+        if provider not in allowed_providers:
+            allowed_text = "', '".join(sorted(allowed_providers))
+            raise RuntimeConfigurationError(
+                f"Provider for stage '{stage}' in pipeline '{pipeline_name}' must be "
+                f"'{allowed_text}', got '{configured_stage_provider or provider}'."
             )
         return provider
 
@@ -77,13 +114,18 @@ class Settings(BaseSettings):
             ("AI_PROVIDER", self.AI_PROVIDER),
             ("AI_PROVIDER_IDENTITY", self.AI_PROVIDER_IDENTITY),
             ("AI_PROVIDER_RECEIPT", self.AI_PROVIDER_RECEIPT),
+            ("OCR_PROVIDER_IDENTITY", self.OCR_PROVIDER_IDENTITY),
+            ("OCR_PROVIDER_RECEIPT", self.OCR_PROVIDER_RECEIPT),
+            ("VISION_PROVIDER_IDENTITY", self.VISION_PROVIDER_IDENTITY),
+            ("VISION_PROVIDER_RECEIPT", self.VISION_PROVIDER_RECEIPT),
         ):
             if raw_value.strip() and self._normalize_provider(raw_value) not in {
                 "anthropic",
                 "openai",
+                "ollama",
             }:
                 raise RuntimeConfigurationError(
-                    f"{provider_name} must be 'anthropic' or 'openai', got '{raw_value}'."
+                    f"{provider_name} must be 'anthropic', 'openai' or 'ollama', got '{raw_value}'."
                 )
 
         if self.ENVIRONMENT.lower() == "development":
@@ -96,8 +138,10 @@ class Settings(BaseSettings):
             raise RuntimeConfigurationError("CORS_ALLOWED_ORIGINS must define at least one origin.")
 
         configured_providers = {
-            self.provider_for_pipeline("identity"),
-            self.provider_for_pipeline("receipt"),
+            self.provider_for_stage("identity", "ocr"),
+            self.provider_for_stage("identity", "vision"),
+            self.provider_for_stage("receipt", "ocr"),
+            self.provider_for_stage("receipt", "vision"),
         }
 
         if "anthropic" in configured_providers and not self.ANTHROPIC_API_KEY.strip():

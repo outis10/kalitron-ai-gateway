@@ -19,7 +19,7 @@ class IdentityPipeline(BasePipeline):
 
     Steps:
         1. OCR  — extract text and fields from the image
-        2. Vision — assess authenticity, detect tampering
+        2. Vision — evaluate document type, capture quality, and basic consistency
         3. Rules  — validate required identity fields
         4. Score  — compute weighted confidence and routing decision
     """
@@ -90,7 +90,10 @@ class IdentityPipeline(BasePipeline):
 
         # Step 4 — Scoring
         scoring_result = self.scoring_service.calculate_score(
-            ocr_result, vision_result, rules_result
+            ocr_result,
+            vision_result,
+            rules_result,
+            document_type=document_type,
         )
 
         elapsed_ms = self._elapsed_ms(start)
@@ -109,7 +112,11 @@ class IdentityPipeline(BasePipeline):
 
         extracted = IdentityExtractedData(
             full_name=(
-                fields.get("full_name") or fields.get("nombre_completo") or fields.get("nombre")
+                None
+                if document_type == "INE_REVERSO"
+                else (
+                    fields.get("full_name") or fields.get("nombre_completo") or fields.get("nombre")
+                )
             ),
             id_number=(
                 fields.get("id_number")
@@ -117,10 +124,16 @@ class IdentityPipeline(BasePipeline):
                 or fields.get("numero_identificacion")
                 or fields.get("folio")
             ),
-            curp=fields.get("curp"),
-            expiry_date=expiry_date_str,
+            curp=None if document_type == "INE_REVERSO" else fields.get("curp"),
+            expiry_date=None if document_type == "INE_REVERSO" else expiry_date_str,
             date_of_birth=(
-                fields.get("date_of_birth") or fields.get("fecha_nacimiento") or fields.get("dob")
+                None
+                if document_type == "INE_REVERSO"
+                else (
+                    fields.get("date_of_birth")
+                    or fields.get("fecha_nacimiento")
+                    or fields.get("dob")
+                )
             ),
         )
 
@@ -134,7 +147,8 @@ class IdentityPipeline(BasePipeline):
             requires_human_review=scoring_result.requires_human_review,
             extracted_data=extracted,
             is_expired=is_expired,
-            fraud_indicators=vision_result.fraud_indicators,
+            quality_flags=vision_result.quality_flags,
+            consistency_flags=vision_result.consistency_flags,
             breakdown=scoring_result.breakdown,
         )
 

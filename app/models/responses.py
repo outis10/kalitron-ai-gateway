@@ -31,9 +31,13 @@ class OCRResult(BaseModel):
 class VisionResult(BaseModel):
     """Result from the Vision AI service."""
 
-    is_authentic: bool
+    is_authentic: bool = True
     fraud_indicators: list[str] = Field(default_factory=list)
-    authenticity_score: float  # 0.0 – 1.0
+    authenticity_score: float = 0.5  # 0.0 – 1.0
+    document_matches_expected_type: bool = True
+    visual_validation_score: float = 0.5  # 0.0 – 1.0
+    quality_flags: list[str] = Field(default_factory=list)
+    consistency_flags: list[str] = Field(default_factory=list)
     notes: str = ""
 
 
@@ -65,6 +69,12 @@ class ReceiptExtractedData(BaseModel):
     total: str | None = None
     issuer: str | None = None
     receipt_number: str | None = None
+    street: str | None = None
+    colony: str | None = None
+    zip_code: str | None = None
+    city: str | None = None
+    state: str | None = None
+    issue_date: str | None = None
 
 
 class IdentityExtractedData(BaseModel):
@@ -94,6 +104,7 @@ class BaseValidationResponse(BaseModel):
 
 class ReceiptValidationResponse(BaseValidationResponse):
     extracted_data: ReceiptExtractedData
+    is_expired: bool = False
     fraud_indicators: list[str] = Field(default_factory=list)
     breakdown: dict = Field(default_factory=dict)
 
@@ -101,7 +112,8 @@ class ReceiptValidationResponse(BaseValidationResponse):
 class IdentityValidationResponse(BaseValidationResponse):
     extracted_data: IdentityExtractedData
     is_expired: bool
-    fraud_indicators: list[str] = Field(default_factory=list)
+    quality_flags: list[str] = Field(default_factory=list)
+    consistency_flags: list[str] = Field(default_factory=list)
     breakdown: dict = Field(default_factory=dict)
 
 

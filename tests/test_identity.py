@@ -58,12 +58,28 @@ def ocr_expired_ine_result() -> OCRResult:
 
 
 @pytest.fixture()
+def ocr_ine_reverso_result() -> OCRResult:
+    return OCRResult(
+        raw_text="CLAVE DE ELECTOR PRGAJN90010100H600\nCURP PEGJ900101HDFRZN01",
+        structured_fields={
+            "id_number": "PRGAJN90010100H600",
+            "curp": "PEGJ900101HDFRZN01",
+        },
+        confidence=0.91,
+    )
+
+
+@pytest.fixture()
 def vision_authentic_result() -> VisionResult:
     return VisionResult(
         is_authentic=True,
         fraud_indicators=[],
         authenticity_score=0.97,
-        notes="INE document appears genuine. Security features visible.",
+        document_matches_expected_type=True,
+        visual_validation_score=0.97,
+        quality_flags=[],
+        consistency_flags=[],
+        notes="INE image is clear and usable.",
     )
 
 
@@ -71,9 +87,13 @@ def vision_authentic_result() -> VisionResult:
 def vision_fraud_result() -> VisionResult:
     return VisionResult(
         is_authentic=False,
-        fraud_indicators=["Inconsistent font in name field", "Possible lamination tampering"],
+        fraud_indicators=["blurry_image", "document_type_uncertain"],
         authenticity_score=0.35,
-        notes="Multiple anomalies detected. Possible forgery.",
+        document_matches_expected_type=False,
+        visual_validation_score=0.35,
+        quality_flags=["blurry_image"],
+        consistency_flags=["document_type_uncertain"],
+        notes="Image quality is insufficient and document type is uncertain.",
     )
 
 
@@ -229,8 +249,10 @@ class TestIdentityValidationSuccess:
         assert body["is_expired"] is False
         assert body["extracted_data"]["full_name"] == "JUAN PEREZ GARCIA"
         assert body["extracted_data"]["curp"] == "PEGJ900101HDFRZN01"
+        assert body["quality_flags"] == []
+        assert body["consistency_flags"] == []
 
-    def test_auto_rejected_with_fraud(
+    def test_auto_rejected_with_quality_issues(
         self,
         client: TestClient,
         api_headers: dict,
@@ -271,7 +293,56 @@ class TestIdentityValidationSuccess:
         body = resp.json()
         assert body["decision"] == "AUTO_REJECTED"
         assert body["is_expired"] is True
-        assert len(body["fraud_indicators"]) > 0
+        assert body["quality_flags"] == ["blurry_image"]
+        assert body["consistency_flags"] == ["document_type_uncertain"]
+
+    def test_ine_reverso_returns_only_id_data(
+        self,
+        client: TestClient,
+        api_headers: dict,
+        dummy_png: bytes,
+        ocr_ine_reverso_result: OCRResult,
+        vision_authentic_result: VisionResult,
+        scoring_approved_result: ScoringResult,
+    ):
+        rules_result = RulesResult(
+            passed_rules=["has_id_number"],
+            failed_rules=[],
+            rules_score=1.0,
+        )
+        with (
+            patch(
+                "app.pipelines.identity_pipeline.identity_pipeline.ocr_service.extract_text",
+                new_callable=AsyncMock,
+                return_value=ocr_ine_reverso_result,
+            ),
+            patch(
+                "app.pipelines.identity_pipeline.identity_pipeline.vision_service.analyze_document",
+                new_callable=AsyncMock,
+                return_value=vision_authentic_result,
+            ),
+            patch(
+                "app.pipelines.identity_pipeline.rules_engine.validate_identity",
+                return_value=rules_result,
+            ),
+            patch(
+                "app.pipelines.identity_pipeline.identity_pipeline.scoring_service.calculate_score",
+                return_value=scoring_approved_result,
+            ),
+        ):
+            resp = client.post(
+                "/api/v1/validate/identity",
+                headers=api_headers,
+                data={"client_id": "client-004", "document_type": "INE_REVERSO"},
+                files=_upload_file(dummy_png),
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["document_type"] == "INE_REVERSO"
+        assert body["extracted_data"]["id_number"] == "PRGAJN90010100H600"
+        assert body["extracted_data"]["full_name"] is None
+        assert body["extracted_data"]["expiry_date"] is None
 
     def test_pasaporte_document_type(
         self,

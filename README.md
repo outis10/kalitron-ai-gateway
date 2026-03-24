@@ -24,7 +24,7 @@ También expone:
 - Python 3.11+
 - FastAPI
 - Pydantic v2
-- Anthropic Claude Vision / OpenAI Responses API
+- Anthropic Claude Vision / OpenAI Responses API / Ollama Vision
 - Pytest
 - Docker / Docker Compose
 
@@ -46,13 +46,19 @@ Copia `.env.example` a `.env` y ajusta los valores.
 
 Variables principales:
 
-- `AI_PROVIDER`: `anthropic` u `openai`
+- `AI_PROVIDER`: `anthropic`, `openai` u `ollama`
 - `AI_PROVIDER_IDENTITY`: override opcional para `POST /validate/identity`
 - `AI_PROVIDER_RECEIPT`: override opcional para `POST /validate/receipt`
+- `OCR_PROVIDER_IDENTITY`: override opcional por etapa para OCR de identidad
+- `VISION_PROVIDER_IDENTITY`: override opcional por etapa para visión de identidad
+- `OCR_PROVIDER_RECEIPT`: override opcional por etapa para OCR de recibos
+- `VISION_PROVIDER_RECEIPT`: override opcional por etapa para visión de recibos
 - `ANTHROPIC_API_KEY`: API key para Claude
 - `ANTHROPIC_MODEL`: modelo Anthropic a usar
 - `OPENAI_API_KEY`: API key para OpenAI
 - `OPENAI_MODEL`: modelo OpenAI a usar
+- `OLLAMA_HOST`: URL base de Ollama local
+- `OLLAMA_MODEL`: modelo Ollama a usar
 - `API_KEYS`: lista separada por comas para autenticar requests
 - `ENVIRONMENT`: `development` o `production`
 - `CORS_ALLOWED_ORIGINS`: orígenes permitidos, separados por comas
@@ -99,6 +105,14 @@ OPENAI_API_KEY=...
 OPENAI_MODEL=gpt-4.1-mini
 ```
 
+Configuración global para Ollama:
+
+```env
+AI_PROVIDER=ollama
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_MODEL=llama3.2-vision:11b
+```
+
 Configuración mixta por pipeline:
 
 ```env
@@ -111,6 +125,31 @@ ANTHROPIC_MODEL=claude-sonnet-4-6
 
 OPENAI_API_KEY=...
 OPENAI_MODEL=gpt-4.1-mini
+```
+
+Configuración mixta por etapa para identidad:
+
+```env
+AI_PROVIDER=anthropic
+OCR_PROVIDER_IDENTITY=openai
+VISION_PROVIDER_IDENTITY=ollama
+
+ANTHROPIC_API_KEY=...
+OPENAI_API_KEY=...
+OPENAI_MODEL=gpt-4.1-mini
+
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_MODEL=llama3.2-vision:11b
+```
+
+Configuración 100% local para identidad:
+
+```env
+OCR_PROVIDER_IDENTITY=ollama
+VISION_PROVIDER_IDENTITY=ollama
+
+OLLAMA_HOST=http://localhost:11434
+OLLAMA_MODEL=llama3.2-vision:11b
 ```
 
 Con Poetry:
@@ -152,6 +191,7 @@ curl -X POST http://localhost:8000/api/v1/validate/receipt \
   -H "X-API-Key: test-key-1" \
   -F "client_id=client-001" \
   -F "source=manual" \
+  -F "document_type=COMPROBANTE_DOMICILIO" \
   -F "file=@/ruta/al/recibo.png;type=image/png"
 ```
 
@@ -161,13 +201,14 @@ curl -X POST http://localhost:8000/api/v1/validate/receipt \
 curl -X POST http://localhost:8000/api/v1/validate/identity \
   -H "X-API-Key: test-key-1" \
   -F "client_id=client-001" \
-  -F "document_type=INE" \
+  -F "document_type=INE_REVERSO" \
   -F "file=@/ruta/al/documento.jpg;type=image/jpeg"
 ```
 
 Valores válidos:
 
-- `document_type`: `INE`, `PASAPORTE`, `LICENCIA`
+- `document_type` en identidad: `INE`, `INE_REVERSO`, `PASAPORTE`, `LICENCIA`
+- `document_type` en receipt: `RECEIPT`, `COMPROBANTE_DOMICILIO`
 - `source`: `whatsapp`, `crm`, `web`, `manual`
 - tipos de archivo aceptados: `image/jpeg`, `image/png`, `image/webp`
 
@@ -205,9 +246,13 @@ La API responde con una decisión final:
 
 Además devuelve datos extraídos, breakdown del score y señales de fraude cuando existan.
 
+Para `COMPROBANTE_DOMICILIO`, la respuesta incluye campos de dirección y `is_expired`, considerando vencido cualquier comprobante con más de 3 meses de antigüedad.
+
 ## Notas operativas
 
 - En `development`, la validación de configuración es más permisiva.
 - Fuera de `development`, la app exige `API_KEYS`, `CORS_ALLOWED_ORIGINS` y la API key del proveedor activo.
 - El gateway limita el tamaño del archivo y solo acepta `JPEG`, `PNG` y `WebP`.
 - El proveedor puede definirse globalmente con `AI_PROVIDER` o por pipeline con `AI_PROVIDER_IDENTITY` y `AI_PROVIDER_RECEIPT`.
+- Si necesitas separar extracción y visión, puedes usar overrides por etapa con `OCR_PROVIDER_*` y `VISION_PROVIDER_*`.
+- En identidad, el análisis visual está orientado a calidad y consistencia operativa, no a dictaminar falsificación.

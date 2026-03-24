@@ -11,6 +11,8 @@ from app.services.provider_common import normalize_media_type, parse_json_respon
 
 logger = logging.getLogger(__name__)
 
+_IDENTITY_DOCUMENT_TYPES = {"INE", "INE_REVERSO", "PASAPORTE", "LICENCIA"}
+
 _EXTRACT_PROMPT = """Analyze this document image and extract all visible text.
 Return ONLY a valid JSON object (no markdown, no explanation) with this exact structure:
 {
@@ -45,6 +47,27 @@ Return ONLY a valid JSON object (no markdown, no explanation) with this exact st
 
 fraud_indicators should be an empty list [] if no issues are found.
 Be conservative: only flag clear anomalies as fraud indicators."""
+
+_IDENTITY_VISION_PROMPT_TEMPLATE = """Analyze this {document_type} identity document image for operational validation, not forensic authenticity.
+
+Assess:
+- whether the document visually matches the expected type
+- whether the image quality is sufficient for review
+- whether the key text zones appear legible
+- whether there are obvious capture issues such as blur, glare, crop, low contrast, or partial framing
+- whether there are basic inconsistencies between the visible document and the expected type
+
+Return ONLY a valid JSON object (no markdown, no explanation) with this exact structure:
+{{
+  "document_matches_expected_type": <true or false>,
+  "visual_validation_score": <float between 0.0 and 1.0>,
+  "quality_flags": ["<quality issue 1>", "<quality issue 2>"],
+  "consistency_flags": ["<consistency issue 1>", "<consistency issue 2>"],
+  "notes": "<brief operational observation about usability>"
+}}
+
+Use quality_flags for capture problems and consistency_flags for mismatches or uncertainty.
+Be conservative: if the image is ambiguous, lower the score and add flags instead of asserting authenticity or fraud."""
 
 
 class OpenAIOCRService:
@@ -130,7 +153,12 @@ class OpenAIVisionService:
     ) -> VisionResult:
         validated_media_type = normalize_media_type(media_type)
         image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-        prompt = _VISION_PROMPT_TEMPLATE.format(document_type=document_type)
+        prompt_template = (
+            _IDENTITY_VISION_PROMPT_TEMPLATE
+            if document_type in _IDENTITY_DOCUMENT_TYPES
+            else _VISION_PROMPT_TEMPLATE
+        )
+        prompt = prompt_template.format(document_type=document_type)
 
         logger.debug(
             "Sending image to OpenAI for vision analysis (document_type=%s, size=%d bytes)",
@@ -144,10 +172,30 @@ class OpenAIVisionService:
         )
         data = parse_json_response(raw_response, "Vision provider returned invalid JSON.")
 
+        if document_type in _IDENTITY_DOCUMENT_TYPES:
+            quality_flags = [str(flag) for flag in data.get("quality_flags", [])]
+            consistency_flags = [str(flag) for flag in data.get("consistency_flags", [])]
+            visual_score = float(data.get("visual_validation_score", 0.5))
+            matches_expected = bool(data.get("document_matches_expected_type", True))
+            return VisionResult(
+                is_authentic=matches_expected,
+                fraud_indicators=[*quality_flags, *consistency_flags],
+                authenticity_score=visual_score,
+                document_matches_expected_type=matches_expected,
+                visual_validation_score=visual_score,
+                quality_flags=quality_flags,
+                consistency_flags=consistency_flags,
+                notes=data.get("notes", ""),
+            )
+
         return VisionResult(
             is_authentic=bool(data.get("is_authentic", False)),
             fraud_indicators=data.get("fraud_indicators", []),
             authenticity_score=float(data.get("authenticity_score", 0.5)),
+            document_matches_expected_type=bool(data.get("is_authentic", False)),
+            visual_validation_score=float(data.get("authenticity_score", 0.5)),
+            quality_flags=[str(flag) for flag in data.get("fraud_indicators", [])],
+            consistency_flags=[],
             notes=data.get("notes", ""),
         )
 

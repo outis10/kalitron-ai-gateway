@@ -1,6 +1,7 @@
 """Tests for POST /api/v1/validate/receipt"""
 
 import io
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -33,6 +34,27 @@ def ocr_receipt_result() -> OCRResult:
             "total": "150.00",
         },
         confidence=0.92,
+    )
+
+
+@pytest.fixture()
+def ocr_address_proof_result() -> OCRResult:
+    recent_issue_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    return OCRResult(
+        raw_text=(
+            f"CFE\nCALLE REFORMA 123\nCOL. CENTRO\nCIUDAD DE MEXICO\nCDMX\nCP 06600\n"
+            f"FECHA: {recent_issue_date}"
+        ),
+        structured_fields={
+            "street": "CALLE REFORMA 123",
+            "colony": "COL. CENTRO",
+            "zip_code": "06600",
+            "city": "CIUDAD DE MEXICO",
+            "state": "CDMX",
+            "issuer": "CFE",
+            "issue_date": recent_issue_date,
+        },
+        confidence=0.94,
     )
 
 
@@ -198,6 +220,7 @@ class TestReceiptValidationSuccess:
         assert "extracted_data" in body
         assert body["extracted_data"]["issuer"] == "OXXO SA de CV"
         assert body["extracted_data"]["total"] == "150.00"
+        assert body["is_expired"] is False
 
     def test_human_review_decision(
         self,
@@ -240,6 +263,72 @@ class TestReceiptValidationSuccess:
         body = resp.json()
         assert body["decision"] == "HUMAN_REVIEW"
         assert body["requires_human_review"] is True
+
+    def test_address_proof_response_shape(
+        self,
+        client: TestClient,
+        api_headers: dict,
+        dummy_png: bytes,
+        ocr_address_proof_result: OCRResult,
+        vision_authentic_result: VisionResult,
+        scoring_approved_result: ScoringResult,
+    ):
+        rules_result = RulesResult(
+            passed_rules=[
+                "has_issue_date",
+                "has_issuer",
+                "has_street",
+                "has_colony",
+                "has_zip_code",
+                "has_city",
+                "has_state",
+                "issue_date_within_3_months",
+            ],
+            failed_rules=[],
+            rules_score=1.0,
+        )
+        with (
+            patch(
+                "app.pipelines.receipt_pipeline.receipt_pipeline.ocr_service.extract_text",
+                new_callable=AsyncMock,
+                return_value=ocr_address_proof_result,
+            ),
+            patch(
+                "app.pipelines.receipt_pipeline.receipt_pipeline.vision_service.analyze_document",
+                new_callable=AsyncMock,
+                return_value=vision_authentic_result,
+            ),
+            patch(
+                "app.pipelines.receipt_pipeline.rules_engine.validate_receipt",
+                return_value=rules_result,
+            ),
+            patch(
+                "app.pipelines.receipt_pipeline.receipt_pipeline.scoring_service.calculate_score",
+                return_value=scoring_approved_result,
+            ),
+        ):
+            resp = client.post(
+                "/api/v1/validate/receipt",
+                headers=api_headers,
+                data={
+                    "client_id": "client-002",
+                    "source": "manual",
+                    "document_type": "COMPROBANTE_DOMICILIO",
+                },
+                files=_upload_file(dummy_png),
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["document_type"] == "COMPROBANTE_DOMICILIO"
+        assert body["extracted_data"]["street"] == "CALLE REFORMA 123"
+        assert body["extracted_data"]["colony"] == "COL. CENTRO"
+        assert body["extracted_data"]["zip_code"] == "06600"
+        assert body["extracted_data"]["city"] == "CIUDAD DE MEXICO"
+        assert body["extracted_data"]["state"] == "CDMX"
+        assert body["extracted_data"]["issuer"] == "CFE"
+        assert body["extracted_data"]["issue_date"] is not None
+        assert body["is_expired"] is False
 
     def test_jpeg_is_accepted(
         self,

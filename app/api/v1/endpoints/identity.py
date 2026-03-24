@@ -23,9 +23,9 @@ _MAX_FILE_BYTES = settings.MAX_FILE_SIZE_MB * 1024 * 1024
     status_code=status.HTTP_200_OK,
     summary="Validate an identity document",
     description=(
-        "Upload an identity document image (INE, PASAPORTE, LICENCIA) along with its type. "
+        "Upload an identity document image (INE, INE_REVERSO, PASAPORTE, LICENCIA) along with its type. "
         "The gateway runs OCR → Vision AI → Rules Engine → Scoring and returns "
-        "a structured validation result with a routing decision and expiry status."
+        "a structured validation result with routing, expiry status, and image quality checks."
     ),
     tags=["validation"],
 )
@@ -33,7 +33,7 @@ async def validate_identity(
     file: UploadFile = File(..., description="Identity document image (JPEG, PNG, WebP)"),
     client_id: str = Form(..., description="Identifier of the submitting client"),
     document_type: DocumentType = Form(
-        ..., description="Type of identity document: INE, PASAPORTE, LICENCIA"
+        ..., description="Type of identity document: INE, INE_REVERSO, PASAPORTE, LICENCIA"
     ),
     _api_key: str = Depends(verify_api_key),
 ) -> IdentityValidationResponse:
@@ -42,7 +42,7 @@ async def validate_identity(
 
     - **file**: Multipart image file (JPEG / PNG / WebP, max configured MB)
     - **client_id**: Client identifier for traceability
-    - **document_type**: INE | PASAPORTE | LICENCIA
+    - **document_type**: INE | INE_REVERSO | PASAPORTE | LICENCIA
     """
     validate_image_file(file)
 

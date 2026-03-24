@@ -38,6 +38,11 @@ _RECEIPT_NUMBER_KEYS = {
     "numero_factura",
     "numero_ticket",
 }
+_STREET_KEYS = {"street", "calle", "domicilio", "address", "direccion"}
+_COLONY_KEYS = {"colony", "colonia", "neighborhood"}
+_ZIP_CODE_KEYS = {"zip_code", "codigo_postal", "cp", "postal_code"}
+_CITY_KEYS = {"city", "ciudad", "municipio", "town"}
+_STATE_KEYS = {"state", "estado", "province"}
 
 _NAME_KEYS = {"full_name", "nombre", "nombre_completo", "name", "apellidos", "nombre_apellidos"}
 _ID_KEYS = {
@@ -116,7 +121,9 @@ def _parse_date(value: str) -> datetime | None:
 class RulesEngine:
     """Applies business rules to OCR-extracted data for document validation."""
 
-    def validate_receipt(self, ocr_result: OCRResult) -> RulesResult:
+    def validate_receipt(
+        self, ocr_result: OCRResult, document_type: str = "RECEIPT"
+    ) -> RulesResult:
         """
         Validate a receipt document against required field rules.
 
@@ -136,12 +143,24 @@ class RulesEngine:
         passed: list[str] = []
         failed: list[str] = []
 
-        rules: list[tuple[str, bool]] = [
-            ("has_date", _has_field(fields, _DATE_KEYS)),
-            ("has_total", _has_field(fields, _TOTAL_KEYS)),
-            ("has_issuer", _has_field(fields, _ISSUER_KEYS)),
-            ("has_receipt_number", _has_field(fields, _RECEIPT_NUMBER_KEYS)),
-        ]
+        flags: list[str] = []
+        if document_type == "COMPROBANTE_DOMICILIO":
+            rules = [
+                ("has_issue_date", _has_field(fields, _DATE_KEYS)),
+                ("has_issuer", _has_field(fields, _ISSUER_KEYS)),
+                ("has_street", _has_field(fields, _STREET_KEYS)),
+                ("has_colony", _has_field(fields, _COLONY_KEYS)),
+                ("has_zip_code", _has_field(fields, _ZIP_CODE_KEYS)),
+                ("has_city", _has_field(fields, _CITY_KEYS)),
+                ("has_state", _has_field(fields, _STATE_KEYS)),
+            ]
+        else:
+            rules = [
+                ("has_date", _has_field(fields, _DATE_KEYS)),
+                ("has_total", _has_field(fields, _TOTAL_KEYS)),
+                ("has_issuer", _has_field(fields, _ISSUER_KEYS)),
+                ("has_receipt_number", _has_field(fields, _RECEIPT_NUMBER_KEYS)),
+            ]
 
         for rule_name, passed_check in rules:
             if passed_check:
@@ -149,9 +168,34 @@ class RulesEngine:
             else:
                 failed.append(rule_name)
 
+        if document_type == "COMPROBANTE_DOMICILIO":
+            issue_status = self.get_issue_date_freshness_status(fields)
+            if issue_status == "valid":
+                passed.append("issue_date_within_3_months")
+            elif issue_status == "expired":
+                failed.append("issue_date_within_3_months")
+                flags.append("expired_document")
+            else:
+                flags.append("unknown_issue_date")
+
         rules_score = len(passed) / len(rules) if rules else 0.0
-        logger.debug("Receipt rules: passed=%s failed=%s score=%.2f", passed, failed, rules_score)
-        return RulesResult(passed_rules=passed, failed_rules=failed, rules_score=rules_score)
+        if document_type == "COMPROBANTE_DOMICILIO":
+            denominator = len(passed) + len(failed)
+            rules_score = len(passed) / denominator if denominator else 0.0
+        logger.debug(
+            "Receipt rules (%s): passed=%s failed=%s flags=%s score=%.2f",
+            document_type,
+            passed,
+            failed,
+            flags,
+            rules_score,
+        )
+        return RulesResult(
+            passed_rules=passed,
+            failed_rules=failed,
+            flags=flags,
+            rules_score=rules_score,
+        )
 
     def validate_identity(self, ocr_result: OCRResult, document_type: str) -> RulesResult:
         """
@@ -175,6 +219,28 @@ class RulesEngine:
         passed: list[str] = []
         failed: list[str] = []
         flags: list[str] = []
+
+        if document_type == "INE_REVERSO":
+            if _has_field(fields, _ID_KEYS):
+                passed.append("has_id_number")
+            else:
+                failed.append("has_id_number")
+
+            rules_score = len(passed) / (len(passed) + len(failed)) if (passed or failed) else 0.0
+            logger.debug(
+                "Identity rules (%s): passed=%s failed=%s flags=%s score=%.2f",
+                document_type,
+                passed,
+                failed,
+                flags,
+                rules_score,
+            )
+            return RulesResult(
+                passed_rules=passed,
+                failed_rules=failed,
+                flags=flags,
+                rules_score=rules_score,
+            )
 
         # has_full_name
         if _has_field(fields, _NAME_KEYS):
@@ -234,6 +300,25 @@ class RulesEngine:
     def get_expiry_date_str(self, fields: dict) -> str | None:
         """Return the raw expiry date string if found, else None."""
         for key in _EXPIRY_KEYS:
+            if key in fields and fields[key]:
+                return str(fields[key])
+        return None
+
+    @staticmethod
+    def get_issue_date_freshness_status(fields: dict) -> str:
+        """Return valid, expired, or unknown for issue dates older than 3 months."""
+        for key in _DATE_KEYS:
+            if key in fields and fields[key]:
+                parsed = _parse_date(str(fields[key]))
+                if parsed is not None:
+                    max_age = datetime.now() - timedelta(days=92)
+                    return "valid" if parsed >= max_age else "expired"
+                return "unknown"
+        return "unknown"
+
+    def get_issue_date_str(self, fields: dict) -> str | None:
+        """Return the raw issue date string if found, else None."""
+        for key in _DATE_KEYS:
             if key in fields and fields[key]:
                 return str(fields[key])
         return None

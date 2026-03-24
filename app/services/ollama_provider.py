@@ -1,0 +1,173 @@
+import asyncio
+import base64
+import logging
+
+import httpx
+
+from app.core.config import settings
+from app.core.errors import ProviderResponseError, UpstreamServiceError
+from app.models.responses import OCRResult, VisionResult
+from app.services.provider_common import parse_json_response
+
+logger = logging.getLogger(__name__)
+
+_EXTRACT_PROMPT = """Analyze this document image and extract all visible text.
+Return ONLY a valid JSON object (no markdown, no explanation) with this exact structure:
+{
+  "raw_text": "<all text visible in the document as a single string>",
+  "structured_fields": {
+    "<field_name>": "<value>"
+  },
+  "confidence": <float between 0.0 and 1.0 representing extraction confidence>
+}
+
+For structured_fields, extract key-value pairs using lowercase English keys such as:
+date, total, issuer, receipt_number, full_name, id_number, curp, expiry_date, date_of_birth, address, rfc, folio.
+Only include fields that are actually visible in the document."""
+
+_IDENTITY_VISION_PROMPT_TEMPLATE = """Analyze this {document_type} identity document image for operational validation, not forensic authenticity.
+
+Assess:
+- whether the document visually matches the expected type
+- whether the image quality is sufficient for review
+- whether the key text zones appear legible
+- whether there are obvious capture issues such as blur, glare, crop, low contrast, or partial framing
+- whether there are basic inconsistencies between the visible document and the expected type
+
+Return ONLY a valid JSON object (no markdown, no explanation) with this exact structure:
+{{
+  "document_matches_expected_type": <true or false>,
+  "visual_validation_score": <float between 0.0 and 1.0>,
+  "quality_flags": ["<quality issue 1>", "<quality issue 2>"],
+  "consistency_flags": ["<consistency issue 1>", "<consistency issue 2>"],
+  "notes": "<brief operational observation about usability>"
+}}
+
+Use quality_flags for capture problems and consistency_flags for mismatches or uncertainty.
+Be conservative: if the image is ambiguous, lower the score and add flags instead of asserting authenticity or fraud."""
+
+
+class OllamaOCRService:
+    def __init__(self, config=settings) -> None:
+        self.settings = config
+        self.base_url = self.settings.OLLAMA_HOST.rstrip("/")
+
+    async def extract_text(self, image_bytes: bytes, media_type: str = "image/jpeg") -> OCRResult:
+        del media_type
+        image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+        logger.debug("Sending image to Ollama for OCR extraction (size=%d bytes)", len(image_bytes))
+
+        data = await self._request(_EXTRACT_PROMPT, image_b64)
+        return OCRResult(
+            raw_text=str(data.get("raw_text", "")),
+            structured_fields=data.get("structured_fields", {}),
+            confidence=float(data.get("confidence", 0.5)),
+        )
+
+    async def _request(self, prompt: str, image_b64: str) -> dict:
+        payload = {
+            "model": self.settings.OLLAMA_MODEL,
+            "prompt": prompt,
+            "images": [image_b64],
+            "stream": False,
+            "format": "json",
+        }
+        return await _request_ollama_json(
+            base_url=self.base_url,
+            payload=payload,
+            timeout_seconds=self.settings.OLLAMA_TIMEOUT_SECONDS,
+            max_retries=self.settings.OLLAMA_MAX_RETRIES,
+            operation_name="OCR",
+        )
+
+
+class OllamaVisionService:
+    def __init__(self, config=settings) -> None:
+        self.settings = config
+        self.base_url = self.settings.OLLAMA_HOST.rstrip("/")
+
+    async def analyze_document(
+        self,
+        image_bytes: bytes,
+        document_type: str,
+        media_type: str = "image/jpeg",
+    ) -> VisionResult:
+        del media_type
+        image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+        prompt = _IDENTITY_VISION_PROMPT_TEMPLATE.format(document_type=document_type)
+
+        logger.debug(
+            "Sending image to Ollama for vision analysis (document_type=%s, size=%d bytes)",
+            document_type,
+            len(image_bytes),
+        )
+
+        data = await self._request(prompt, image_b64)
+        quality_flags = [str(flag) for flag in data.get("quality_flags", [])]
+        consistency_flags = [str(flag) for flag in data.get("consistency_flags", [])]
+        visual_score = float(data.get("visual_validation_score", 0.5))
+        matches_expected = bool(data.get("document_matches_expected_type", True))
+
+        return VisionResult(
+            is_authentic=matches_expected,
+            fraud_indicators=[*quality_flags, *consistency_flags],
+            authenticity_score=visual_score,
+            document_matches_expected_type=matches_expected,
+            visual_validation_score=visual_score,
+            quality_flags=quality_flags,
+            consistency_flags=consistency_flags,
+            notes=data.get("notes", ""),
+        )
+
+    async def _request(self, prompt: str, image_b64: str) -> dict:
+        payload = {
+            "model": self.settings.OLLAMA_MODEL,
+            "prompt": prompt,
+            "images": [image_b64],
+            "stream": False,
+            "format": "json",
+        }
+        return await _request_ollama_json(
+            base_url=self.base_url,
+            payload=payload,
+            timeout_seconds=self.settings.OLLAMA_TIMEOUT_SECONDS,
+            max_retries=self.settings.OLLAMA_MAX_RETRIES,
+            operation_name="Vision",
+        )
+
+
+async def _request_ollama_json(
+    *,
+    base_url: str,
+    payload: dict,
+    timeout_seconds: float,
+    max_retries: int,
+    operation_name: str,
+) -> dict:
+    last_error: Exception | None = None
+    for attempt in range(max_retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+                response = await client.post(f"{base_url}/api/generate", json=payload)
+            response.raise_for_status()
+            body = response.json()
+            content = body.get("response")
+            if not isinstance(content, str) or not content.strip():
+                raise ProviderResponseError(
+                    f"{operation_name} provider returned an unexpected response."
+                )
+            return parse_json_response(content, f"{operation_name} provider returned invalid JSON.")
+        except ProviderResponseError:
+            raise
+        except Exception as exc:  # pragma: no cover
+            last_error = exc
+            logger.warning(
+                "Ollama %s request failed on attempt %d: %s",
+                operation_name,
+                attempt + 1,
+                exc,
+            )
+            if attempt < max_retries:
+                await asyncio.sleep(0.25 * (attempt + 1))
+    raise UpstreamServiceError(f"{operation_name} provider is unavailable.") from last_error

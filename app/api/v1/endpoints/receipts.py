@@ -6,7 +6,7 @@ from app.api.v1.uploads import read_limited_upload, validate_image_file
 from app.core.config import settings
 from app.core.errors import ProviderResponseError, UpstreamServiceError
 from app.core.security import verify_api_key
-from app.models.requests import DocumentSource
+from app.models.requests import DocumentSource, ReceiptDocumentType
 from app.models.responses import ReceiptValidationResponse
 from app.pipelines.receipt_pipeline import receipt_pipeline
 
@@ -23,7 +23,7 @@ _MAX_FILE_BYTES = settings.MAX_FILE_SIZE_MB * 1024 * 1024
     status_code=status.HTTP_200_OK,
     summary="Validate a receipt document",
     description=(
-        "Upload a receipt image (JPEG, PNG, WebP) along with optional metadata. "
+        "Upload a receipt or address-proof image (JPEG, PNG, WebP) along with optional metadata. "
         "The gateway runs OCR → Vision AI → Rules Engine → Scoring and returns "
         "a structured validation result with a routing decision."
     ),
@@ -35,6 +35,10 @@ async def validate_receipt(
     source: DocumentSource = Form(
         DocumentSource.MANUAL, description="Origin channel of the document"
     ),
+    document_type: ReceiptDocumentType = Form(
+        ReceiptDocumentType.RECEIPT,
+        description="Type of receipt document: RECEIPT or COMPROBANTE_DOMICILIO",
+    ),
     _api_key: str = Depends(verify_api_key),
 ) -> ReceiptValidationResponse:
     """
@@ -43,6 +47,7 @@ async def validate_receipt(
     - **file**: Multipart image file (JPEG / PNG / WebP, max configured MB)
     - **client_id**: Client identifier for traceability
     - **source**: Channel that submitted the document (whatsapp, crm, web, manual)
+    - **document_type**: RECEIPT | COMPROBANTE_DOMICILIO
     """
     validate_image_file(file)
 
@@ -63,13 +68,18 @@ async def validate_receipt(
         result = await receipt_pipeline.process(
             image_bytes=image_bytes,
             media_type=media_type,
-            metadata={"client_id": client_id, "source": source.value},
+            metadata={
+                "client_id": client_id,
+                "source": source.value,
+                "document_type": document_type.value,
+            },
         )
     except ProviderResponseError as exc:
         logger.warning(
-            "Receipt provider returned invalid payload for client_id=%s source=%s: %s",
+            "Receipt provider returned invalid payload for client_id=%s source=%s document_type=%s: %s",
             client_id,
             source.value,
+            document_type.value,
             exc,
         )
         raise HTTPException(
@@ -78,9 +88,10 @@ async def validate_receipt(
         ) from exc
     except UpstreamServiceError as exc:
         logger.warning(
-            "Receipt provider unavailable for client_id=%s source=%s: %s",
+            "Receipt provider unavailable for client_id=%s source=%s document_type=%s: %s",
             client_id,
             source.value,
+            document_type.value,
             exc,
         )
         raise HTTPException(
@@ -89,7 +100,10 @@ async def validate_receipt(
         ) from exc
     except Exception as exc:
         logger.exception(
-            "Receipt pipeline failed for client_id=%s source=%s", client_id, source.value
+            "Receipt pipeline failed for client_id=%s source=%s document_type=%s",
+            client_id,
+            source.value,
+            document_type.value,
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
